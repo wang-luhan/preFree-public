@@ -69,6 +69,6 @@ Mkfile.old
 dkms.conf
 # Performance data log
 # *.log
-# *.csv
+*.csv
 *.xlsx
 

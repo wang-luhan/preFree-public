@@ -8,9 +8,8 @@
 
 tile内: bucket
 if: LUT
-
-
 */
+
 __global__ void pre_startRowPerBlock(const int *__restrict__ row_ptr,
                                      const int m,
                                      int *__restrict__ startRowPerBlock,
@@ -20,12 +19,6 @@ __global__ void pre_startRowPerBlock(const int *__restrict__ row_ptr,
 
   if (global_thread_id >= m)
     return;
-  /*
-    if (global_thread_id == 0)
-  {
-    startRowPerBlock[0] = 0;
-  }
-  */
   int a = row_ptr[global_thread_id];
   int b = row_ptr[min(global_thread_id + 1, (int)m)];
   int blocka = divup<int>(a, tileSize);
@@ -33,60 +26,6 @@ __global__ void pre_startRowPerBlock(const int *__restrict__ row_ptr,
   if (a != b)
     for (; blocka <= blockb; ++blocka)
       startRowPerBlock[blocka] = global_thread_id;
-}
-
-template <int THREADS_PER_BLOCK>
-__device__ __forceinline__ void reduce_oneRow_in_thread(int NNZ_PER_BLOCK, const int tid_in_block, const int block_id,
-                                                        const int reduceStartRowId, const int reduceEndRowId,
-                                                        const int *__restrict__ row_ptr,
-                                                        const valT *__restrict__ smem, valT *__restrict__ y)
-{
-  int reduce_row_id = reduceStartRowId + tid_in_block;
-  int nnz_id_before = block_id * NNZ_PER_BLOCK;
-  for (; reduce_row_id < reduceEndRowId; reduce_row_id += THREADS_PER_BLOCK)
-  {
-    valT sum = 0;
-    // const int reduce_start_idx = max((int)0, row_ptr[reduce_row_id] - nnz_id_before);
-    // const int reduce_end_idx = min(NNZ_PER_BLOCK, row_ptr[reduce_row_id + 1] - nnz_id_before);
-    const int reduce_start_idx = (row_ptr[reduce_row_id] - nnz_id_before) < 0 ? 0 : (row_ptr[reduce_row_id] - nnz_id_before);
-    const int reduce_end_idx = (row_ptr[reduce_row_id + 1] - nnz_id_before) > NNZ_PER_BLOCK ? NNZ_PER_BLOCK : (row_ptr[reduce_row_id + 1] - nnz_id_before);
-    for (int i = reduce_start_idx; i < reduce_end_idx; i++)
-    {
-      sum += smem[i];
-    }
-    atomicAdd(y + reduce_row_id, sum);
-  }
-}
-
-template <int THREADS_PER_BLOCK>
-__device__ __forceinline__ void reduce_oneRow_in_thread_2atomic(int NNZ_PER_BLOCK, const int tid_in_block, const int block_id,
-                                                                const int reduceStartRowId, const int reduceEndRowId,
-                                                                const int *__restrict__ row_ptr,
-                                                                const valT *__restrict__ smem, valT *__restrict__ y)
-{
-  int reduce_row_id = reduceStartRowId + tid_in_block;
-  int nnz_id_before = block_id * NNZ_PER_BLOCK;
-  for (; reduce_row_id < reduceEndRowId; reduce_row_id += THREADS_PER_BLOCK)
-  {
-    valT sum = 0;
-    // const int reduce_start_idx = max((int)0, row_ptr[reduce_row_id] - nnz_id_before);
-    // const int reduce_end_idx = min(NNZ_PER_BLOCK, row_ptr[reduce_row_id + 1] - nnz_id_before);
-    const int reduce_start_idx = (row_ptr[reduce_row_id] - nnz_id_before) < 0 ? 0 : (row_ptr[reduce_row_id] - nnz_id_before);
-    const int reduce_end_idx = (row_ptr[reduce_row_id + 1] - nnz_id_before) > NNZ_PER_BLOCK ? NNZ_PER_BLOCK : (row_ptr[reduce_row_id + 1] - nnz_id_before);
-    for (int i = reduce_start_idx; i < reduce_end_idx; i++)
-    {
-      sum += smem[i];
-    }
-    // atomicAdd(y + reduce_row_id, sum);
-    if (reduce_row_id == reduceStartRowId || reduce_row_id == reduceEndRowId - 1)
-    {
-      atomicAdd(y + reduce_row_id, sum);
-    }
-    else
-    {
-      y[reduce_row_id] += sum;
-    }
-  }
 }
 
 template <int THREADS_PER_BLOCK>
@@ -122,42 +61,23 @@ __device__ __forceinline__ void reduce_oneRow_in_block(int NNZ_PER_BLOCK, const 
 }
 
 template <int THREADS_PER_BLOCK>
-__device__ __forceinline__ void reduce_oneRow_in_block_optimized(int NNZ_PER_BLOCK, const int tid_in_block, const int block_id,
-                                                                 const int reduceStartRowId,
-                                                                 const int *__restrict__ row_ptr,
-                                                                 const valT *__restrict__ smem, valT *__restrict__ y)
+__device__ __forceinline__ void reduce_oneRow_in_thread(int NNZ_PER_BLOCK, const int tid_in_block, const int block_id,
+                                                        const int reduceStartRowId, const int reduceEndRowId,
+                                                        const int *__restrict__ row_ptr,
+                                                        const valT *__restrict__ smem, valT *__restrict__ y)
 {
-  constexpr int num_warps = THREADS_PER_BLOCK >> 5;
-  __shared__ valT warp_results[num_warps];
-  const int reduce_start_idx = max((int)0, row_ptr[reduceStartRowId] - block_id * NNZ_PER_BLOCK);
-  const int reduce_end_idx = min(NNZ_PER_BLOCK, row_ptr[reduceStartRowId + 1] - block_id * NNZ_PER_BLOCK);
-
-  valT thread_sum = 0;
-  for (int j = reduce_start_idx + tid_in_block; j < reduce_end_idx; j += THREADS_PER_BLOCK)
+  int reduce_row_id = reduceStartRowId + tid_in_block;
+  int nnz_id_before = block_id * NNZ_PER_BLOCK;
+  for (; reduce_row_id < reduceEndRowId; reduce_row_id += THREADS_PER_BLOCK)
   {
-    thread_sum += smem[j];
-  }
-
-  for (int offset = 16; offset > 0; offset >>= 1)
-  {
-    thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
-  }
-  const int warp_id = tid_in_block >> 5;
-  const int lane_id = tid_in_block & 31;
-  if (lane_id == 0)
-  {
-    warp_results[warp_id] = thread_sum;
-  }
-  __syncthreads();
-
-  if (tid_in_block == 0)
-  {
-    valT final_sum = 0;
-    for (int i = 0; i < num_warps; i++)
+    valT sum = 0;
+    const int reduce_start_idx = max((int)0, row_ptr[reduce_row_id] - nnz_id_before);
+    const int reduce_end_idx = min(NNZ_PER_BLOCK, row_ptr[reduce_row_id + 1] - nnz_id_before);
+    for (int i = reduce_start_idx; i < reduce_end_idx; i++)
     {
-      final_sum += warp_results[i];
+      sum += smem[i];
     }
-    atomicAdd(y + reduceStartRowId, final_sum);
+    atomicAdd(y + reduce_row_id, sum);
   }
 }
 
@@ -209,6 +129,118 @@ reduce_oneRow_in_vector(int NNZ_PER_BLOCK, const int n_reduce_rows_num, const in
   }
 }
 
+
+template <int THREADS_PER_BLOCK, int VECTOR_SIZE>
+__device__ __forceinline__ void
+reduce_oneRow_in_vector_L(int NNZ_PER_BLOCK, const int n_reduce_rows_num, const int tid_in_block, const int block_id,
+                          const int reduceStartRowId, const int reduceEndRowId,
+                          const int *__restrict__ row_ptr, const valT *__restrict__ smem, valT *__restrict__ y)
+{
+  // use `vec_num` vectors, each vector can process reduction of one row by involving `vec_size` threads.
+  const int vec_size = VECTOR_SIZE;
+  const int vec_num = THREADS_PER_BLOCK / vec_size;
+  const int vec_id = tid_in_block / vec_size;
+  const int tid_in_vec = tid_in_block & (vec_size - 1);
+  const int warp_lane_id = tid_in_block & 31;
+
+  int reduce_row_id = reduceStartRowId + vec_id;
+  for (; reduce_row_id < reduceEndRowId; reduce_row_id += vec_num)
+  {
+    const int reduce_start_idx = max((int)0, row_ptr[reduce_row_id] - block_id * NNZ_PER_BLOCK);
+    const int reduce_end_idx = min((int)NNZ_PER_BLOCK, row_ptr[reduce_row_id + 1] - block_id * NNZ_PER_BLOCK);
+    // reduce LDS via vectors.
+    valT sum = 0;
+    for (int i = reduce_start_idx + tid_in_vec; i < reduce_end_idx; i += vec_size)
+    {
+      sum += smem[i];
+    }
+    // sum = warpReduceSum<vec_size>(sum);
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+      sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    // store value
+    if (warp_lane_id == 0)
+    {
+      atomicAdd(y + reduce_row_id, sum);
+    }
+  }
+}
+
+
+
+// optimized for 2 atomic add
+
+
+template <int THREADS_PER_BLOCK>
+__device__ __forceinline__ void reduce_oneRow_in_block_optimized(int NNZ_PER_BLOCK, const int tid_in_block, const int block_id,
+                                                                 const int reduceStartRowId,
+                                                                 const int *__restrict__ row_ptr,
+                                                                 const valT *__restrict__ smem, valT *__restrict__ y)
+{
+  constexpr int num_warps = THREADS_PER_BLOCK >> 5;
+  __shared__ valT warp_results[num_warps];
+  const int reduce_start_idx = max((int)0, row_ptr[reduceStartRowId] - block_id * NNZ_PER_BLOCK);
+  const int reduce_end_idx = min(NNZ_PER_BLOCK, row_ptr[reduceStartRowId + 1] - block_id * NNZ_PER_BLOCK);
+
+  valT thread_sum = 0;
+  for (int j = reduce_start_idx + tid_in_block; j < reduce_end_idx; j += THREADS_PER_BLOCK)
+  {
+    thread_sum += smem[j];
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1)
+  {
+    thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+  }
+  const int warp_id = tid_in_block >> 5;
+  const int lane_id = tid_in_block & 31;
+  if (lane_id == 0)
+  {
+    warp_results[warp_id] = thread_sum;
+  }
+  __syncthreads();
+
+  if (tid_in_block == 0)
+  {
+    valT final_sum = 0;
+    for (int i = 0; i < num_warps; i++)
+    {
+      final_sum += warp_results[i];
+    }
+    atomicAdd(y + reduceStartRowId, final_sum);
+  }
+}
+
+template <int THREADS_PER_BLOCK>
+__device__ __forceinline__ void reduce_oneRow_in_thread_2atomic(int NNZ_PER_BLOCK, const int tid_in_block, const int block_id,
+                                                                const int reduceStartRowId, const int reduceEndRowId,
+                                                                const int *__restrict__ row_ptr,
+                                                                const valT *__restrict__ smem, valT *__restrict__ y)
+{
+  int reduce_row_id = reduceStartRowId + tid_in_block;
+  int nnz_id_before = block_id * NNZ_PER_BLOCK;
+  for (; reduce_row_id < reduceEndRowId; reduce_row_id += THREADS_PER_BLOCK)
+  {
+    valT sum = 0;
+    const int reduce_start_idx = max((int)0, row_ptr[reduce_row_id] - nnz_id_before);
+    const int reduce_end_idx = min(NNZ_PER_BLOCK, row_ptr[reduce_row_id + 1] - nnz_id_before);
+    for (int i = reduce_start_idx; i < reduce_end_idx; i++)
+    {
+      sum += smem[i];
+    }
+    // atomicAdd(y + reduce_row_id, sum);
+    if (reduce_row_id == reduceStartRowId || reduce_row_id == reduceEndRowId - 1)
+    {
+      atomicAdd(y + reduce_row_id, sum);
+    }
+    else
+    {
+      y[reduce_row_id] += sum;
+    }
+  }
+}
+
 template <int THREADS_PER_BLOCK, int VECTOR_SIZE>
 __device__ __forceinline__ void
 reduce_oneRow_in_vector_2atomic(int NNZ_PER_BLOCK, const int n_reduce_rows_num, const int tid_in_block, const int block_id,
@@ -250,43 +282,6 @@ reduce_oneRow_in_vector_2atomic(int NNZ_PER_BLOCK, const int n_reduce_rows_num, 
   }
 }
 
-template <int THREADS_PER_BLOCK, int VECTOR_SIZE>
-__device__ __forceinline__ void
-reduce_oneRow_in_vector_L(int NNZ_PER_BLOCK, const int n_reduce_rows_num, const int tid_in_block, const int block_id,
-                          const int reduceStartRowId, const int reduceEndRowId,
-                          const int *__restrict__ row_ptr, const valT *__restrict__ smem, valT *__restrict__ y)
-{
-  // use `vec_num` vectors, each vector can process reduction of one row by involving `vec_size` threads.
-  const int vec_size = VECTOR_SIZE;
-  const int vec_num = THREADS_PER_BLOCK / vec_size;
-  const int vec_id = tid_in_block / vec_size;
-  const int tid_in_vec = tid_in_block & (vec_size - 1);
-  const int warp_lane_id = tid_in_block & 31;
-
-  int reduce_row_id = reduceStartRowId + vec_id;
-  for (; reduce_row_id < reduceEndRowId; reduce_row_id += vec_num)
-  {
-    const int reduce_start_idx = max((int)0, row_ptr[reduce_row_id] - block_id * NNZ_PER_BLOCK);
-    const int reduce_end_idx = min((int)NNZ_PER_BLOCK, row_ptr[reduce_row_id + 1] - block_id * NNZ_PER_BLOCK);
-    // reduce LDS via vectors.
-    valT sum = 0;
-    for (int i = reduce_start_idx + tid_in_vec; i < reduce_end_idx; i += vec_size)
-    {
-      sum += smem[i];
-    }
-    // sum = warpReduceSum<vec_size>(sum);
-    for (int offset = 16; offset > 0; offset >>= 1)
-    {
-      sum += __shfl_down_sync(0xffffffff, sum, offset);
-    }
-    // store value
-    if (warp_lane_id == 0)
-    {
-      atomicAdd(y + reduce_row_id, sum);
-    }
-  }
-}
-
 template <int THREADS_PER_BLOCK>
 __global__ void cdspmv_kernel(valT *__restrict__ d_val,
                               int *__restrict__ d_ptr,
@@ -324,13 +319,13 @@ __global__ void cdspmv_kernel(valT *__restrict__ d_val,
   const int n_reduce_rows_num = reduceEndRowId - reduceStartRowId;
   if (n_reduce_rows_num > 64)
   {
-    reduce_oneRow_in_thread<THREADS_PER_BLOCK>(productNnzPerBlock, threadIdx.x, blockIdx.x,
+    reduce_oneRow_in_thread_2atomic<THREADS_PER_BLOCK>(productNnzPerBlock, threadIdx.x, blockIdx.x,
                                                reduceStartRowId, reduceEndRowId,
                                                d_ptr, middle_s, d_y);
   }
   else if (n_reduce_rows_num == 1)
   {
-    reduce_oneRow_in_block<THREADS_PER_BLOCK>(productNnzPerBlock, threadIdx.x, blockIdx.x,
+    reduce_oneRow_in_block_optimized<THREADS_PER_BLOCK>(productNnzPerBlock, threadIdx.x, blockIdx.x,
                                               reduceStartRowId,
                                               d_ptr, middle_s, d_y);
   }
@@ -342,92 +337,34 @@ __global__ void cdspmv_kernel(valT *__restrict__ d_val,
   }
   else if (n_reduce_rows_num <= 4)
   {
-    reduce_oneRow_in_vector<THREADS_PER_BLOCK, 32>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
+    reduce_oneRow_in_vector_2atomic<THREADS_PER_BLOCK, 32>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
                                                    reduceStartRowId, reduceEndRowId,
                                                    d_ptr, middle_s, d_y);
   }
   else if (n_reduce_rows_num <= 8)
   {
-    reduce_oneRow_in_vector<THREADS_PER_BLOCK, 16>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
+    reduce_oneRow_in_vector_2atomic<THREADS_PER_BLOCK, 16>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
                                                    reduceStartRowId, reduceEndRowId,
                                                    d_ptr, middle_s, d_y);
   }
   else if (n_reduce_rows_num <= 16)
   {
-    reduce_oneRow_in_vector<THREADS_PER_BLOCK, 8>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
+    reduce_oneRow_in_vector_2atomic<THREADS_PER_BLOCK, 8>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
                                                   reduceStartRowId, reduceEndRowId,
                                                   d_ptr, middle_s, d_y);
   }
   else if (n_reduce_rows_num <= 32)
   {
-    reduce_oneRow_in_vector<THREADS_PER_BLOCK, 4>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
+    reduce_oneRow_in_vector_2atomic<THREADS_PER_BLOCK, 4>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
                                                   reduceStartRowId, reduceEndRowId,
                                                   d_ptr, middle_s, d_y);
   }
   else if (n_reduce_rows_num <= 64)
   {
-    reduce_oneRow_in_vector<THREADS_PER_BLOCK, 2>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
+    reduce_oneRow_in_vector_2atomic<THREADS_PER_BLOCK, 2>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
                                                   reduceStartRowId, reduceEndRowId,
                                                   d_ptr, middle_s, d_y);
   }
-  /*
-  // 线程256
-  if (n_reduce_rows_num > 128)
-  {
-    reduce_oneRow_in_thread<THREADS_PER_BLOCK>(productNnzPerBlock, threadIdx.x, blockIdx.x,
-                                                                          reduceStartRowId, reduceEndRowId,
-                                                                          d_ptr, middle_s, d_y);
-  }
-  else if (n_reduce_rows_num == 1)
-  {
-
-    reduce_oneRow_in_block<THREADS_PER_BLOCK>(productNnzPerBlock, threadIdx.x, blockIdx.x,
-                                                                         reduceStartRowId,
-                                                                         d_ptr, middle_s, d_y);
-  }
-  else if (n_reduce_rows_num == 2)
-  {
-    reduce_oneRow_in_vector_L<THREADS_PER_BLOCK, 128>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
-                                                                                reduceStartRowId, reduceEndRowId,
-                                                                                d_ptr, middle_s, d_y);
-  }
-  else if (n_reduce_rows_num <= 4)
-  {
-    reduce_oneRow_in_vector_L<THREADS_PER_BLOCK, 64>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
-                                                                                reduceStartRowId, reduceEndRowId,
-                                                                                d_ptr, middle_s, d_y);
-  }
-  else if (n_reduce_rows_num <= 8)
-  {
-    reduce_oneRow_in_vector<THREADS_PER_BLOCK, 32>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
-                                                                             reduceStartRowId, reduceEndRowId,
-                                                                             d_ptr, middle_s, d_y);
-  }
-  else if (n_reduce_rows_num <= 16)
-  {
-    reduce_oneRow_in_vector<THREADS_PER_BLOCK, 16>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
-                                                                             reduceStartRowId, reduceEndRowId,
-                                                                             d_ptr, middle_s, d_y);
-  }
-  else if (n_reduce_rows_num <= 32)
-  {
-    reduce_oneRow_in_vector<THREADS_PER_BLOCK, 8>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
-                                                                             reduceStartRowId, reduceEndRowId,
-                                                                             d_ptr, middle_s, d_y);
-  }
-  else if (n_reduce_rows_num <= 64)
-  {
-    reduce_oneRow_in_vector<THREADS_PER_BLOCK, 4>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
-                                                                             reduceStartRowId, reduceEndRowId,
-                                                                             d_ptr, middle_s, d_y);
-  }
-  else if (n_reduce_rows_num <= 128)
-  {
-    reduce_oneRow_in_vector<THREADS_PER_BLOCK, 2>(productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
-                                                                             reduceStartRowId, reduceEndRowId,
-                                                                             d_ptr, middle_s, d_y);
-  }
-  */
 }
 
 void cdspmv(valT *csrVal, int *csrRowPtr, int *csrColInd,

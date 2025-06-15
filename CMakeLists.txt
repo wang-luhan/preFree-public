@@ -22,16 +22,7 @@ endif()
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 set(CMAKE_CUDA_ARCHITECTURES "80")
 
-option(ENABLE_CUDA_MEMCHECK "Enable cuda-memcheck support" OFF)
 option(USE_FP64 "Enable fp64 support" ON)
-
-if(ENABLE_CUDA_MEMCHECK)
-    message(STATUS "cuda-memcheck is enabled")
-    set(CMAKE_BUILD_TYPE Debug)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -O0")
-else()
-    message(STATUS "cuda-memcheck is disabled")
-endif()
 
 if(USE_FP64)
     message(STATUS "FP64 is enabled")
@@ -40,7 +31,6 @@ else()
     message(STATUS "FP64 is disabled")
 endif()
 
-set(the_description "cuda")  
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 file(GLOB cuda_sources "${CMAKE_CURRENT_SOURCE_DIR}/src/**/*.cu")

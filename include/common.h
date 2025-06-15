@@ -5,15 +5,14 @@
 #include <cstring>
 #include <cstdio>
 #include <omp.h>
-#include <cstdlib> // 为了使用malloc和free
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 #include <cstdint>
 #include <fstream>
 #include <filesystem>
 #include <array>
-#include <cstddef> // for size_t
-// 其他可能需要的头文件
+#include <cstddef>
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -25,9 +24,6 @@
 #include <thrust/copy.h>
 #include <parallel/algorithm>
 
-// #include <cuda/std/future>
-// #include <cuda_pipeline.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,21 +31,10 @@
 #include <sys/time.h>
 #include <math.h>
 
-// #include <helper_cuda.h>
-// #include <helper_functions.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cusparse.h>
 #include <cublas_v2.h>
-
-// #include <thrust/device_vector.h>
-// #include <thrust/host_vector.h>
-// #include <thrust/sort.h>
-// #include <thrust/unique.h>
-// #include <torch/extension.h>
-// #include <vector>
-
-#include "omp.h"
 
 #ifdef fp64
 #define valT double
@@ -59,10 +44,7 @@
 #define valT half
 #define BUF_CUDA_R_TYPE CUDA_R_32F
 #define VAL_CUDA_R_TYPE CUDA_R_16F
-
 #endif
-
-
 
 #define CUDA_CHECK_ERROR(call)                                            \
     {                                                                     \
@@ -75,14 +57,11 @@
         }                                                                 \
     }
 
-
-
 template <typename T>
 __host__ __device__ __forceinline__ T divup(T a, T b)
 {
   return (a + b - 1) / b;
 }
-
 
 class CudaTimer {
 public:

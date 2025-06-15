@@ -1,19 +1,5 @@
 #include "PreFree.h"
 #include "mmio.h"
-//-------------------------------------------------------------------------------
-// int resCompare(double *our_val, double *cuda_val, int length)
-// {
-//     for (int i = 0; i < length; i++)
-//     {
-//         if (fabs(our_val[i] - cuda_val[i]) > 1e-5)
-//         {
-//             printf("error in (%d), cusp(%4.2f), cuda(%4.2f),please check your code!\n", i, our_val[i], cuda_val[i]);
-//             return -1;
-//         }
-//     }
-//     printf("Y(%d), compute succeed!\n", length);
-//     return 0;
-// }
 
 void spmv_serial(valT *csrVal, int *csrRowPtr, int *csrColInd,
                  valT *X_val, valT *Y_val, int rowA, int colA, int nnzA)
@@ -208,22 +194,13 @@ int main(int argc, char **argv)
     cusparse_spmv_all(csrVal, csrRowPtr, csrColInd, X_val, cuY_val, rowA, colA, nnzA, data_origin1, data_origin2, &cu_time, &cu_gflops, &cu_bandwidth1, &cu_bandwidth2, &cu_pre);
 
     double cdTime = 0, cdPre = 0;
-    cdspmv(csrVal, csrRowPtr, csrColInd, X_val, Y_val, rowA, colA, nnzA, &cdTime, &cdPre);
+    preFreeSpMV(csrVal, csrRowPtr, csrColInd, X_val, Y_val, rowA, colA, nnzA, &cdTime, &cdPre);
     spmv_serial(csrVal, csrRowPtr, csrColInd, X_val, Y_val_s, rowA, colA, nnzA);
 
     printf("our_perf:%8.4lf ms, our_pre:%8.4lf ms\n", cdTime, cdPre);
     printf("cusparse_perf:%8.4lf ms, cusparse_pre:%8.4lf ms\n", cu_time, cu_pre);
-    // printf("\n iterate= %d\n", iter);
 
-    // FILE *fout;
-    // fout = fopen("data/spmv_f64_record.csv", "a");
-    // fprintf(fout, "%lld,%lf,%lf,%lf,%lf\n", data_origin1, cu_time, cu_gflops, cu_bandwidth1, cu_bandwidth2);
-    // fclose(fout);
-
-    /* verify the result with cusparse */
-
-    // int result = eQcheck(cuY_val, Y_val, rowA);
-    int result = eQcheck(Y_val_s, Y_val, rowA);
+    eQcheck(Y_val_s, Y_val, rowA);
 
     free(X_val);
     free(Y_val);
