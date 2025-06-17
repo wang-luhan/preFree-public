@@ -68,6 +68,7 @@ __device__ __forceinline__ void reduce_oneRow_in_thread(int NNZ_PER_BLOCK, const
 {
   int reduce_row_id = reduceStartRowId + tid_in_block;
   int nnz_id_before = block_id * NNZ_PER_BLOCK;
+  // TODO: warp中的其他线程要等着当前线程结束
   for (; reduce_row_id < reduceEndRowId; reduce_row_id += THREADS_PER_BLOCK)
   {
     valT sum = 0;

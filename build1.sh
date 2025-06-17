@@ -33,7 +33,7 @@ matrices=(
 )
 
 # 创建CSV文件并写入标题
-csv_file="../performance_results_2atomic.csv"
+csv_file="../performance_results_dynamic_25666666.csv"
 echo "Matrix,Our_Perf(ms),cuSPAESE_Perf(ms),Our_Pre(ms),cuSPAESE_Pre(ms),Elements" > $csv_file
 
 echo ""
