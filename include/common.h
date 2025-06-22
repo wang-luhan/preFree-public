@@ -60,19 +60,22 @@
 template <typename T>
 __host__ __device__ __forceinline__ T divup(T a, T b)
 {
-  return (a + b - 1) / b;
+    return (a + b - 1) / b;
 }
 
-class CudaTimer {
+class CudaTimer
+{
 public:
     /**
      * @brief 构造函数，创建两个 CUDA 事件用于计时。
      */
-    CudaTimer() {
+    CudaTimer()
+    {
         // 检查 CUDA API 调用是否成功是一种好习惯
         cudaError_t err_start = cudaEventCreate(&start_event);
         cudaError_t err_stop = cudaEventCreate(&stop_event);
-        if (err_start != cudaSuccess || err_stop != cudaSuccess) {
+        if (err_start != cudaSuccess || err_stop != cudaSuccess)
+        {
             std::cerr << "Failed to create CUDA events!" << std::endl;
         }
     }
@@ -80,7 +83,8 @@ public:
     /**
      * @brief 析构函数，销毁已创建的 CUDA 事件，防止资源泄漏。
      */
-    ~CudaTimer() {
+    ~CudaTimer()
+    {
         cudaEventDestroy(start_event);
         cudaEventDestroy(stop_event);
     }
@@ -88,13 +92,14 @@ public:
     // --- 禁止拷贝和赋值 ---
     // 删除拷贝构造函数和拷贝赋值运算符，防止用户意外地拷贝计时器对象，
     // 这可能导致对同一CUDA事件的重复销毁，从而引发运行时错误。
-    CudaTimer(const CudaTimer&) = delete;
-    CudaTimer& operator=(const CudaTimer&) = delete;
+    CudaTimer(const CudaTimer &) = delete;
+    CudaTimer &operator=(const CudaTimer &) = delete;
 
     /**
      * @brief 开始计时。在GPU流上记录一个起始点。
      */
-    void start() {
+    void start()
+    {
         cudaEventRecord(start_event, 0); // 在默认流上记录事件
     }
 
@@ -104,10 +109,11 @@ public:
      *
      * 该函数会记录一个停止事件，并同步等待该事件完成，以确保计时的准确性。
      */
-    float stop() {
+    float stop()
+    {
         float elapsed_ms = 0.0f;
-        cudaEventRecord(stop_event, 0);        // 在默认流上记录结束事件
-        cudaEventSynchronize(stop_event);      // 阻塞CPU，直到结束事件在GPU上完成
+        cudaEventRecord(stop_event, 0);                             // 在默认流上记录结束事件
+        cudaEventSynchronize(stop_event);                           // 阻塞CPU，直到结束事件在GPU上完成
         cudaEventElapsedTime(&elapsed_ms, start_event, stop_event); // 计算两个事件间的耗时
         return elapsed_ms;
     }
@@ -117,7 +123,6 @@ private:
     cudaEvent_t stop_event;  // 结束事件句柄
 };
 
-
 inline void initVec(valT *vec, int length)
 {
 
@@ -125,5 +130,24 @@ inline void initVec(valT *vec, int length)
     {
         vec[i] = static_cast<valT>(static_cast<float>(i % 15));
     }
-
 }
+
+#define CHECK_CUDA(func)                                                                                                                                             \
+    {                                                                                                                                                                \
+        cudaError_t status = (func);                                                                                                                                 \
+        if (status != cudaSuccess)                                                                                                                                   \
+        {                                                                                                                                                            \
+            throw std::runtime_error("CUDA API failed at " + std::string(__FILE__) + ":" + std::to_string(__LINE__) + " with error: " + cudaGetErrorString(status)); \
+        }                                                                                                                                                            \
+    }
+
+
+#define CHECK_CUSPARSE(func)                                                                                                                                                 \
+    {                                                                                                                                                                        \
+        cusparseStatus_t status = (func);                                                                                                                                    \
+        if (status != CUSPARSE_STATUS_SUCCESS)                                                                                                                               \
+        {                                                                                                                                                                    \
+            throw std::runtime_error("CUSPARSE API failed at " + std::string(__FILE__) + ":" + std::to_string(__LINE__) + " with error: " + cusparseGetErrorString(status)); \
+        }                                                                                                                                                                    \
+    }
+    

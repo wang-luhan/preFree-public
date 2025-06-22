@@ -1,0 +1,4 @@
+Matrix,Our_Perf(ms),cuSPAESE_Perf(ms),Our_Pre(ms),cuSPAESE_Pre(ms),Elements
+poisson3Db,0.0454,0.0636,0.8069,0.0508,85623
+circuit5M,1.6249,1.5383,2.1494,1.0057,5558326
+nlpkkt240,16.8087,17.2413,0.7905,0.9748,27993600

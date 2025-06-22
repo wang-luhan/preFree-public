@@ -48,47 +48,7 @@ else()
     message(FATAL_ERROR "CUDA compiler not found! Please install CUDA toolkit.")
 endif()
 
-# Find cuSPARSE library with multiple search strategies
-find_library(CUSPARSE_LIBRARY 
-    NAMES cusparse libcusparse.so libcusparse
-    PATHS 
-        "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/../lib64"
-        "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/../lib"
-        "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/../targets/x86_64-linux/lib"
-        "/usr/local/cuda/lib64"
-        "/usr/local/cuda/lib"
-        "/usr/local/cuda/targets/x86_64-linux/lib"
-        "$ENV{CUDA_PATH}/lib64"
-        "$ENV{CUDA_PATH}/lib"
-        "$ENV{CUDA_HOME}/lib64"
-        "$ENV{CUDA_HOME}/lib"
-)
-
-
-if(NOT CUSPARSE_LIBRARY)
-    find_library(CUSPARSE_LIBRARY 
-        NAMES cusparse libcusparse.so libcusparse
-        PATHS /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib
-    )
-endif()
-
-# Find OpenMP
-find_package(OpenMP REQUIRED)
-
-if(CUSPARSE_LIBRARY)
-    message(STATUS "cuSPARSE library found: ${CUSPARSE_LIBRARY}")
-else()
-    message(STATUS "Searching for cuSPARSE in system paths...")
-    execute_process(
-        COMMAND find /usr -name "*cusparse*" 2>/dev/null
-        OUTPUT_VARIABLE CUSPARSE_SEARCH_RESULT
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-    if(CUSPARSE_SEARCH_RESULT)
-        message(STATUS "Found cuSPARSE files: ${CUSPARSE_SEARCH_RESULT}")
-    endif()
-    message(FATAL_ERROR "cuSPARSE library not found! Please install CUDA toolkit with cuSPARSE.")
-endif()
+find_package(CUDAToolkit REQUIRED COMPONENTS cusparse)
 
 message(STATUS "CUDA include dirs: ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
 
@@ -107,20 +67,46 @@ set(CUDA_UTILITIES_PATH ${CMAKE_CURRENT_SOURCE_DIR}/utilities)
 
 file(GLOB cuda_utilities "${CUDA_UTILITIES_PATH}/*.cpp")
 add_library(cuda_utilities_lib STATIC ${cuda_utilities})
-target_link_libraries(cuda_utilities_lib ${CUSPARSE_LIBRARY})
+target_link_libraries(cuda_utilities_lib PRIVATE CUDA::cusparse)
 
 file(GLOB CUDA_TEST_FILES "${CUDA_TEST_PATH}/test_cdspmv.cpp")
 message(STATUS "CUDA_TEST_FILES: ${CUDA_TEST_FILES}")
 
 if(CUDA_TEST_FILES)
     add_executable(cuda_perftest ${CUDA_TEST_FILES})
-    target_link_libraries(cuda_perftest PreFreelib cuda_utilities_lib ${CUSPARSE_LIBRARY})
-    target_include_directories(cuda_perftest PRIVATE ${PROJECT_SOURCE_DIR}/include)
-    
-    # Link CUDA runtime
-    if(TARGET CUDA::cudart)
-        target_link_libraries(cuda_perftest CUDA::cudart)
-    endif()
+    target_include_directories(cuda_perftest PRIVATE 
+        ${PROJECT_SOURCE_DIR}/include
+        ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    )
+
+    target_link_libraries(cuda_perftest PRIVATE 
+        PreFreelib 
+        cuda_utilities_lib 
+        CUDA::cusparse
+        CUDA::cudart
+    )
 else()
     message(FATAL_ERROR "No test files found!")
+endif()
+
+# Add statistic executable
+file(GLOB STATISTIC_FILES "${CUDA_TEST_PATH}/statistic.cu")
+if(STATISTIC_FILES)
+    add_executable(statistic ${STATISTIC_FILES})
+    set_property(TARGET statistic PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+    target_include_directories(statistic PRIVATE 
+        ${PROJECT_SOURCE_DIR}/include
+        ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    )
+
+    target_link_libraries(statistic PRIVATE 
+        PreFreelib 
+        cuda_utilities_lib 
+        CUDA::cusparse
+        CUDA::cudart
+    )
+    
+    message(STATUS "Added statistic executable")
+else()
+    message(WARNING "No statistic files found!")
 endif()

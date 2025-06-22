@@ -52,7 +52,7 @@ int eQcheck(valT *tmp1, valT *tmp2, int length)
     printf("Success! All values match within the tolerance for %d elements.\n", length);
     return 0;
 }
-
+/*
 void cusparse_spmv_all(valT *cu_ValA, int *cu_RowPtrA, int *cu_ColIdxA,
                        valT *cu_ValX, valT *cu_ValY, int rowA, int colA, int nnzA,
                        long long int data_origin1, long long int data_origin2, double *cu_time, double *cu_gflops, double *cu_bandwidth1, double *cu_bandwidth2, double *cu_pre)
@@ -150,7 +150,118 @@ void cusparse_spmv_all(valT *cu_ValA, int *cu_RowPtrA, int *cu_ColIdxA,
     cudaFree(dX);
     cudaFree(dY);
 }
+*/
 
+void cusparse_spmv_all(valT *cu_ValA, int *cu_RowPtrA, int *cu_ColIdxA,
+                       valT *cu_ValX, valT *cu_ValY, int rowA, int colA, int nnzA,
+                       long long int data_origin1, long long int data_origin2, double *cu_time, double *cu_gflops, double *cu_bandwidth1, double *cu_bandwidth2, double *cu_pre)
+{
+    CudaTimer timer;
+    valT *dA_val, *dX, *dY;
+    int *dA_cid;
+    int *dA_rpt;
+    valT alpha = (valT)1.0;
+    valT beta = (valT)0.0;
+
+    // --- 1. 初始化 cuSPARSE 和分配设备内存 ---
+    cusparseHandle_t handle = NULL;
+    CHECK_CUSPARSE(cusparseCreate(&handle));
+
+    CHECK_CUDA(cudaMalloc((void **)&dA_val, sizeof(valT) * nnzA));
+    CHECK_CUDA(cudaMalloc((void **)&dA_cid, sizeof(int) * nnzA));
+    CHECK_CUDA(cudaMalloc((void **)&dA_rpt, sizeof(int) * (rowA + 1)));
+    CHECK_CUDA(cudaMalloc((void **)&dX, sizeof(valT) * colA));
+    CHECK_CUDA(cudaMalloc((void **)&dY, sizeof(valT) * rowA));
+
+    // --- 2. 将数据从主机拷贝到设备 ---
+    CHECK_CUDA(cudaMemcpy(dA_val, cu_ValA, sizeof(valT) * nnzA, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(dA_cid, cu_ColIdxA, sizeof(int) * nnzA, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(dA_rpt, cu_RowPtrA, sizeof(int) * (rowA + 1), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(dX, cu_ValX, sizeof(valT) * colA, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemset(dY, 0, sizeof(valT) * rowA)); // 使用 0 而非 0.0 更通用
+
+    // --- 3. 创建 cuSPARSE 描述符 ---
+    
+    cusparseDnVecDescr_t vecX, vecY;
+
+    // 创建稀疏矩阵描述符 (CSR格式)
+    
+    // 创建稠密向量描述符
+    CHECK_CUSPARSE(cusparseCreateDnVec(&vecX, colA, dX, VAL_CUDA_R_TYPE));
+    CHECK_CUSPARSE(cusparseCreateDnVec(&vecY, rowA, dY, VAL_CUDA_R_TYPE));
+
+    
+    
+    timer.start(); // 开始计时预处理时间
+    // --- 4. 预处理阶段 ---
+    void *dBuffer = NULL;
+    size_t bufferSize = 0;
+    cusparseSpMatDescr_t matA;
+    CHECK_CUSPARSE(cusparseCreateCsr(&matA, rowA, colA, nnzA, dA_rpt, dA_cid, dA_val,
+                                     CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                     CUSPARSE_INDEX_BASE_ZERO, VAL_CUDA_R_TYPE));
+
+    // 4.1 获取预处理所需的缓冲区大小
+    CHECK_CUSPARSE(cusparseSpMV_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                           &alpha, matA, vecX, &beta, vecY, BUF_CUDA_R_TYPE,
+                                           CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize));
+
+    // 4.2 分配缓冲区
+    CHECK_CUDA(cudaMalloc(&dBuffer, bufferSize));
+
+    // 4.3 执行预处理 (这是您想测试的关键函数)
+    CHECK_CUSPARSE(cusparseSpMV_preprocess(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                           &alpha, matA, vecX, &beta, vecY, BUF_CUDA_R_TYPE,
+                                           CUSPARSE_SPMV_ALG_DEFAULT, dBuffer));
+
+    CHECK_CUDA(cudaDeviceSynchronize()); // 确保预处理完成
+    *cu_pre = (double)timer.stop(); // 停止计时，记录预处理时间
+
+    // --- 5. 执行阶段 ---
+    int warm_iter = 200;
+    int test_iter = 4000;
+
+    // 5.1 预热，确保 GPU 达到稳定频率
+    for (int i = 0; i < warm_iter; ++i)
+    {
+        CHECK_CUSPARSE(cusparseSpMV(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                    &alpha, matA, vecX, &beta, vecY, BUF_CUDA_R_TYPE,
+                                    CUSPARSE_SPMV_ALG_DEFAULT, dBuffer));
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // 5.2 计时测试
+    timer.start();
+    for (int i = 0; i < test_iter; ++i)
+    {
+        CHECK_CUSPARSE(cusparseSpMV(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                    &alpha, matA, vecX, &beta, vecY, BUF_CUDA_R_TYPE,
+                                    CUSPARSE_SPMV_ALG_DEFAULT, dBuffer));
+    }
+    CHECK_CUDA(cudaDeviceSynchronize()); // 等待所有 SpMV 操作完成
+    float total_loop_time_ms = timer.stop();
+
+    // --- 6. 获取结果并计算性能指标 ---
+    CHECK_CUDA(cudaMemcpy(cu_ValY, dY, sizeof(valT) * rowA, cudaMemcpyDeviceToHost));
+
+    *cu_time = (double)total_loop_time_ms / test_iter;
+    *cu_gflops = (double)((long long)nnzA * 2) / (*cu_time * 1e6);
+    *cu_bandwidth1 = (double)data_origin1 / (*cu_time * 1e6);
+    *cu_bandwidth2 = (double)data_origin2 / (*cu_time * 1e6);
+
+    // --- 7. 清理资源 ---
+    CHECK_CUDA(cudaFree(dBuffer));
+    CHECK_CUDA(cudaFree(dA_val));
+    CHECK_CUDA(cudaFree(dA_cid));
+    CHECK_CUDA(cudaFree(dA_rpt));
+    CHECK_CUDA(cudaFree(dX));
+    CHECK_CUDA(cudaFree(dY));
+    
+    CHECK_CUSPARSE(cusparseDestroySpMat(matA));
+    CHECK_CUSPARSE(cusparseDestroyDnVec(vecX));
+    CHECK_CUSPARSE(cusparseDestroyDnVec(vecY));
+    CHECK_CUSPARSE(cusparseDestroy(handle));
+}
 int main(int argc, char **argv)
 {
     if (argc < 2)
