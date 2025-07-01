@@ -1,1 +1,0 @@
-make gpu_spmv sm=800 CXXFLAGS="-DCUB_STD_OPTIONAL=1"
