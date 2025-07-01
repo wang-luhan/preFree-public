@@ -12,6 +12,7 @@ struct TileStatistics {
     int n_reduce_rows_num;
     int max_row_length;
     int min_row_length;
+    double row_length_ratio;  // max_row_length / min_row_length
     double avg_row_length;
     double variance;
     int start_row;
@@ -75,6 +76,14 @@ TileStatistics calculateTileStatistics(int tile_id, int start_row, int end_row,
     // 计算最大、最小和平均长度
     stats.max_row_length = *std::max_element(row_lengths_in_tile.begin(), row_lengths_in_tile.end());
     stats.min_row_length = *std::min_element(row_lengths_in_tile.begin(), row_lengths_in_tile.end());
+    
+    // 计算行长度比值 (避免除零)
+    if (stats.min_row_length > 0) {
+        stats.row_length_ratio = static_cast<double>(stats.max_row_length) / stats.min_row_length;
+    } else {
+        stats.row_length_ratio = 0.0;  // 如果min_row_length为0，设置比值为0
+    }
+    
     stats.avg_row_length = static_cast<double>(total_length) / stats.n_reduce_rows_num;
     
     // 计算方差
@@ -137,7 +146,9 @@ void analyzeMatrixTiles(const char* filename) {
     
     // 设置算法参数（与原算法相同）
     const int THREADS_PER_BLOCK = 128;
-    int productNnzPerThread = 4;
+    // int productNnzPerThread = 4;
+    int productNnzPerThread = ((nnz > 16518948) && (((float) nnz / ((float) m) < 500))) ? 8 : 4;
+
     int productNnzPerBlock = THREADS_PER_BLOCK * productNnzPerThread;
     const int WORK_BLOCKS = nnz / productNnzPerBlock + 
                            ((nnz % productNnzPerBlock == 0) ? 0 : 1);
@@ -205,12 +216,13 @@ void analyzeMatrixTiles(const char* filename) {
     }
     
     // 写入CSV头部
-    csvFile << "tile_id,n_reduce_rows_num,max_row_length,min_row_length,avg_row_length,variance,start_row,end_row\n";
+    csvFile << "tile_id,n_reduce_rows_num,row_length_ratio,max_row_length,min_row_length,avg_row_length,variance,start_row,end_row\n";
     
     // 写入每个tile的统计信息
     for (const auto& stats : tileStats) {
         csvFile << stats.tile_id << ","
                 << stats.n_reduce_rows_num << ","
+                << std::fixed << std::setprecision(2) << stats.row_length_ratio << ","
                 << stats.max_row_length << ","
                 << stats.min_row_length << ","
                 << std::fixed << std::setprecision(2) << stats.avg_row_length << ","

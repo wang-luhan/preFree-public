@@ -1,9 +1,9 @@
 #include "common.h"
 
-__global__ void pre_startRowPerTile(const int *__restrict__ row_ptr,
-                                    const int m,
-                                    int *__restrict__ startRowPerBlock,
-                                    int tileSize)
+__global__ void pre_start_rowPerTile(const int *__restrict__ row_ptr,
+                                     const int m,
+                                     int *__restrict__ start_row,
+                                     int tileSize)
 {
   const int row_id = blockIdx.x * blockDim.x + threadIdx.x;
   if (row_id >= m)
@@ -22,29 +22,29 @@ __global__ void pre_startRowPerTile(const int *__restrict__ row_ptr,
   {
     if (i >= start_block)
     {
-      startRowPerBlock[i] = row_id;
+      start_row[i] = row_id;
     }
   }
 }
 
-template <int THREADS_PER_BLOCK>
+template <int TILE_NNZ, int BLOCK_SIZE>
 __device__ __forceinline__ void
-red_row_block(int NNZ_PER_BLOCK, const int tid_in_block, const int block_id,
-              const int reduceStartRowId,
+red_row_block(const int tid_in_block, const int block_id,
+              const int tileStartRow,
               const int *__restrict__ row_ptr,
               const valT *__restrict__ smem, valT *__restrict__ y)
 {
-  constexpr int num_warps = THREADS_PER_BLOCK >> 5;
+  constexpr int num_warps = BLOCK_SIZE >> 5;
   __shared__ valT warp_results[num_warps];
-  const int reduce_start_idx = max((int)0, row_ptr[reduceStartRowId] - block_id * NNZ_PER_BLOCK);
-  const int reduce_end_idx = min(NNZ_PER_BLOCK, row_ptr[reduceStartRowId + 1] - block_id * NNZ_PER_BLOCK);
+  const int reduce_start_idx = max((int)0, row_ptr[tileStartRow] - block_id * TILE_NNZ);
+  const int reduce_end_idx = min(TILE_NNZ, row_ptr[tileStartRow + 1] - block_id * TILE_NNZ);
 
   valT thread_sum = 0;
-  for (int j = reduce_start_idx + tid_in_block; j < reduce_end_idx; j += THREADS_PER_BLOCK)
+  for (int j = reduce_start_idx + tid_in_block; j < reduce_end_idx; j += BLOCK_SIZE)
   {
     thread_sum += smem[j];
   }
-
+#pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1)
   {
     thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
@@ -64,50 +64,29 @@ red_row_block(int NNZ_PER_BLOCK, const int tid_in_block, const int block_id,
     {
       final_sum += warp_results[i];
     }
-    atomicAdd(y + reduceStartRowId, final_sum);
+    atomicAdd(y + tileStartRow, final_sum);
   }
 }
 
-template <int THREADS_PER_BLOCK>
-__device__ __forceinline__ void
-red_row_thread(int NNZ_PER_BLOCK, const int tid_in_block, const int block_id,
-               const int reduceStartRowId, const int reduceEndRowId,
-               const int *__restrict__ row_ptr,
-               const valT *__restrict__ smem, valT *__restrict__ y)
+template <int TILE_NNZ, int BLOCK_SIZE>
+__device__ __forceinline__ void red_row_thread(const int tid_in_block, const int block_id,
+                                               const int tileStartRow, const int tileEndRow,
+                                               const int *__restrict__ row_ptr,
+                                               const valT *__restrict__ smem, valT *__restrict__ y)
 {
-  // 1. 设置共享内存原子计数器
-  __shared__ int next_row_offset;
-  if (tid_in_block == 0)
+  int reduce_row_id = tileStartRow + tid_in_block;
+  int nnz_id_before = block_id * TILE_NNZ;
+  for (; reduce_row_id < tileEndRow; reduce_row_id += BLOCK_SIZE)
   {
-    next_row_offset = 0;
-  }
-  __syncthreads();
-
-  const int nnz_id_before = block_id * NNZ_PER_BLOCK;
-  // 2. 动态获取任务的循环
-  while (true)
-  {
-    // 每个线程都独立地去获取一个新行作为任务
-    const int my_row_offset = atomicAdd(&next_row_offset, 1);
-    const int reduce_row_id = reduceStartRowId + my_row_offset;
-
-    // 3. 检查任务是否已经取完
-    if (reduce_row_id >= reduceEndRowId)
-    {
-      break; // 所有行都已被处理，退出循环
-    }
-
-    // 4. 执行计算 (与原函数相同的串行计算)
     valT sum = 0;
     const int reduce_start_idx = max((int)0, row_ptr[reduce_row_id] - nnz_id_before);
-    const int reduce_end_idx = min(NNZ_PER_BLOCK, row_ptr[reduce_row_id + 1] - nnz_id_before);
-
+    const int reduce_end_idx = min(TILE_NNZ, row_ptr[reduce_row_id + 1] - nnz_id_before);
     for (int i = reduce_start_idx; i < reduce_end_idx; i++)
     {
       sum += smem[i];
     }
     // atomicAdd(y + reduce_row_id, sum);
-    if (reduce_row_id == reduceStartRowId || reduce_row_id == reduceEndRowId - 1)
+    if (reduce_row_id == tileStartRow || reduce_row_id == tileEndRow - 1)
     {
       atomicAdd(y + reduce_row_id, sum);
     }
@@ -134,45 +113,31 @@ __device__ __forceinline__ valT warpReduceSum(valT sum)
   return sum;
 }
 
-#define MAX_ROWS_PER_BLOCK 128
-template <int THREADS_PER_BLOCK, int VECTOR_SIZE>
+template <int TILE_NNZ, int BLOCK_SIZE, int VECTOR_SIZE>
 __device__ __forceinline__ void
-red_row_vector_1(int NNZ_PER_BLOCK, const int n_reduce_rows_num, const int tid_in_block, const int block_id,
-                 const int reduceStartRowId, const int reduceEndRowId,
-                 const int *__restrict__ row_ptr, const valT *__restrict__ smem, valT *__restrict__ y)
+red_row_vector(const int tid_in_block, const int block_id,
+               const int tileStartRow, const int tileEndRow,
+               const int *__restrict__ row_ptr, const valT *__restrict__ smem, valT *__restrict__ y)
 {
-  __shared__ int s_cached_ptr[MAX_ROWS_PER_BLOCK + 1];
-  for (int i = tid_in_block; i < n_reduce_rows_num + 1; i += THREADS_PER_BLOCK)
-  {
-    s_cached_ptr[i] = row_ptr[reduceStartRowId + i];
-  }
-  __syncthreads();
-
-  const int vec_num = THREADS_PER_BLOCK / VECTOR_SIZE;
+  const int vec_num = BLOCK_SIZE / VECTOR_SIZE;
   const int vec_id = tid_in_block / VECTOR_SIZE;
   const int tid_in_vec = tid_in_block & (VECTOR_SIZE - 1);
 
-  for (int row_offset = vec_id; row_offset < n_reduce_rows_num; row_offset += vec_num)
+  int reduce_row_id = tileStartRow + vec_id;
+
+  for (; reduce_row_id < tileEndRow; reduce_row_id += vec_num)
   {
-    const int reduce_row_id = reduceStartRowId + row_offset;
-
-    const int row_start_ptr = s_cached_ptr[row_offset];
-    const int row_end_ptr = s_cached_ptr[row_offset + 1];
-
-    const int reduce_start_idx = max((int)0, row_start_ptr - block_id * NNZ_PER_BLOCK);
-    const int reduce_end_idx = min((int)NNZ_PER_BLOCK, row_end_ptr - block_id * NNZ_PER_BLOCK);
-
+    const int reduce_start_idx = max((int)0, row_ptr[reduce_row_id] - block_id * TILE_NNZ);
+    const int reduce_end_idx = min((int)TILE_NNZ, row_ptr[reduce_row_id + 1] - block_id * TILE_NNZ);
     valT sum = 0;
     for (int i = reduce_start_idx + tid_in_vec; i < reduce_end_idx; i += VECTOR_SIZE)
     {
       sum += smem[i];
     }
-
     sum = warpReduceSum<VECTOR_SIZE>(sum);
-
     if (tid_in_vec == 0)
     {
-      if (n_reduce_rows_num <= 2 || reduce_row_id == reduceStartRowId || reduce_row_id == reduceEndRowId - 1)
+      if (reduce_row_id == tileStartRow || reduce_row_id == tileEndRow - 1)
       {
         atomicAdd(y + reduce_row_id, sum);
       }
@@ -184,186 +149,186 @@ red_row_vector_1(int NNZ_PER_BLOCK, const int n_reduce_rows_num, const int tid_i
   }
 }
 
-
-
-/**
- * @brief 针对“单一超长行 + 多个短行”优化的极致性能规约函数
- * @tparam THREADS_PER_BLOCK      块内线程总数 (例如 128)
- * @tparam VECTOR_SIZE            短行处理团队的Vector大小 (例如 16)
- * @tparam LONG_ROW_WARPS         分配给长行处理的Warp数量 (建议为块内Warp总数的一半)
- */
-template <int THREADS_PER_BLOCK, int VECTOR_SIZE, int LONG_ROW_WARPS = 2>
-__device__  void
-red_row_vector_3(
-    int NNZ_PER_BLOCK, const int n_reduce_rows_num, const int tid_in_block, const int block_id,
-    const int reduceStartRowId, const int reduceEndRowId,
+template <int BLOCK_SIZE, int LONG_ROW_THREADS>
+__device__ __forceinline__ void
+red_row_long_short_specialized(
+    int TILE_NNZ, const int n_reduce_rows_num, const int tid_in_block, const int block_id,
+    const int tileStartRow, const int tileEndRow,
     const int *__restrict__ row_ptr, const valT *__restrict__ smem, valT *__restrict__ y)
 {
   // ====================================================================================
-  // 阶段 1: 块内并行分析，识别长行，分离长短行 (逻辑不变，保持正确)
+  // 阶段 0: 共享内存声明
   // ====================================================================================
+  // s_long_row_info: [0] = max_len, [1] = local_idx
+  __shared__ int s_long_row_info[2];
+  // s_final_sums: 存储所有行的最终计算结果
+  __shared__ valT s_final_sums[32];
+  // s_warp_sums: 用于长行处理时，存储每个warp的规约结果
+  __shared__ valT s_warp_sums[BLOCK_SIZE / 32];
 
-  // --- 共享内存声明 ---
-  __shared__ int s_row_lens[MAX_ROWS_PER_BLOCK];
-  __shared__ int s_long_row_info[2]; // {max_len, local_idx}
-  __shared__ valT s_final_sums[MAX_ROWS_PER_BLOCK];
-  __shared__ int s_short_row_map[MAX_ROWS_PER_BLOCK];
-  __shared__ int s_short_row_count;
-  // [修正] 为长行团队的跨Warp规约准备的共享内存
-  __shared__ valT s_long_row_warp_sums[LONG_ROW_WARPS];
-
-  // --- 并行初始化 ---
-  for (int i = tid_in_block; i < n_reduce_rows_num; i += THREADS_PER_BLOCK)
-  {
-    s_final_sums[i] = 0.0;
-  }
-  if (tid_in_block == 0)
-  {
-    s_long_row_info[0] = -1;
-    s_long_row_info[1] = -1;
-    s_short_row_count = 0;
-  }
-  __syncthreads();
-
-  // --- 并行计算行长并找到最长行 ---
-  for (int i = tid_in_block; i < n_reduce_rows_num; i += THREADS_PER_BLOCK)
-  {
-    s_row_lens[i] = row_ptr[reduceStartRowId + i + 1] - row_ptr[reduceStartRowId + i];
-  }
-  __syncthreads();
-  for (int i = tid_in_block; i < n_reduce_rows_num; i += THREADS_PER_BLOCK)
-  {
-    atomicMax(&s_long_row_info[0], s_row_lens[i]);
-  }
-  __syncthreads();
-  if (tid_in_block == 0)
-  {
-    for (int i = 0; i < n_reduce_rows_num; i++)
-    {
-      if (s_row_lens[i] == s_long_row_info[0])
-      {
-        s_long_row_info[1] = i;
-        break;
-      }
-    }
-  }
-  __syncthreads();
-
-  // --- 创建短行索引的紧凑映射表 ---
+  // ====================================================================================
+  // 阶段 1: 长行识别 (逻辑不变, 已足够高效)
+  // ====================================================================================
   if (tid_in_block < 32)
   {
-    for (int i = tid_in_block; i < n_reduce_rows_num; i += 32)
+    const int lane_id = tid_in_block;
+    int my_len = -1;
+    // 使用 s_final_sums 作为临时存储来初始化，避免额外写操作
+    if (lane_id < n_reduce_rows_num)
     {
-      if (i != s_long_row_info[1])
+      my_len = row_ptr[tileStartRow + lane_id + 1] - row_ptr[tileStartRow + lane_id];
+      s_final_sums[lane_id] = 0.0; // 顺便初始化
+    }
+
+    int max_len = my_len;
+    int max_idx = lane_id;
+
+    // 使用Warp内shuffle指令并行寻找最大值及其索引
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+      int remote_len = __shfl_down_sync(0xFFFFFFFF, max_len, offset);
+      int remote_idx = __shfl_down_sync(0xFFFFFFFF, max_idx, offset);
+      if (remote_len > max_len)
       {
-        int map_idx = atomicAdd(&s_short_row_count, 1);
-        s_short_row_map[map_idx] = i;
+        max_len = remote_len;
+        max_idx = remote_idx;
       }
     }
-  }
-  __syncthreads();
 
-  // ====================================================================================
-  // 阶段 2 & 3: 静态分工与并行执行
-  // ====================================================================================
-  const int warp_id = tid_in_block >> 5;
-  const int lane_id = tid_in_block & 31;
-
-  // ---------------------------
-  //  长行处理团队 (Long-Row Team)
-  // ---------------------------
-  if (warp_id < LONG_ROW_WARPS)
-  {
-    const int long_row_local_idx = s_long_row_info[1];
-    if (long_row_local_idx != -1) // 确保长行已被找到
+    if (lane_id == 0)
     {
-      const int reduce_row_id = reduceStartRowId + long_row_local_idx;
+      s_long_row_info[0] = max_len;
+      s_long_row_info[1] = max_idx;
+    }
+  }
+
+  __syncthreads(); // 同步点1: 确保长行信息对所有线程可见
+
+  // ====================================================================================
+  // 阶段 2: 非对称团队并行执行
+  // ====================================================================================
+  const int long_row_local_idx = s_long_row_info[1];
+
+  // ------------------------------------
+  //  团队A: 长行突击队 (Long Row Assault Team)
+  // ------------------------------------
+  if (tid_in_block < LONG_ROW_THREADS)
+  {
+    if (long_row_local_idx != -1)
+    {
+      const int reduce_row_id = tileStartRow + long_row_local_idx;
       const int row_start_ptr = row_ptr[reduce_row_id];
       const int row_end_ptr = row_ptr[reduce_row_id + 1];
-      const int reduce_start_idx = max((int)0, row_start_ptr - block_id * NNZ_PER_BLOCK);
-      const int reduce_end_idx = min((int)NNZ_PER_BLOCK, row_end_ptr - block_id * NNZ_PER_BLOCK);
+
+      const int reduce_start_idx = max((int)0, row_start_ptr - block_id * TILE_NNZ);
+      const int reduce_end_idx = min((int)TILE_NNZ, row_end_ptr - block_id * TILE_NNZ);
 
       valT thread_sum = 0;
-      const int team_tid = tid_in_block;
-      const int team_size = LONG_ROW_WARPS * 32;
-
-      for (int i = reduce_start_idx + team_tid; i < reduce_end_idx; i += team_size)
+      for (int i = reduce_start_idx + tid_in_block; i < reduce_end_idx; i += LONG_ROW_THREADS)
       {
         thread_sum += smem[i];
       }
 
-      // [修正] 正确的跨Warp规约
-      // 1. Warp内规约
-      thread_sum = warpReduceSum<32>(thread_sum); // 使用一个标准的32线程Warp规约
+      // --- 优化点 2: 高效的Warp + 共享内存规约 ---
+      // 步骤 1: Warp内部规约
+      for (int offset = 16; offset > 0; offset >>= 1)
+      {
+        thread_sum += __shfl_down_sync(0xFFFFFFFF, thread_sum, offset);
+      }
 
-      // 2. Warp leader将结果写入共享内存
+      // 步骤 2: 每个Warp的0号线程将结果写入共享内存
+      const int warp_id = tid_in_block / 32;
+      const int lane_id = tid_in_block % 32;
       if (lane_id == 0)
       {
-        s_long_row_warp_sums[warp_id] = thread_sum;
-      }
-      __syncthreads(); // <<-- 此处同步至关重要！
-
-      // 3. 由单个线程(0号)完成最后的加和
-      if (tid_in_block == 0)
-      {
-        valT total_sum = 0;
-        for (int i = 0; i < LONG_ROW_WARPS; i++)
-        {
-          total_sum += s_long_row_warp_sums[i];
-        }
-        s_final_sums[long_row_local_idx] = total_sum;
+        s_warp_sums[warp_id] = thread_sum;
       }
     }
   }
-  // ---------------------------
-  //  短行处理团队 (Short-Row Team) - (逻辑无误，无需修改)
-  // ---------------------------
+  // ------------------------------------
+  //  团队B: 短行清理队 (Short Row Cleanup Crew)
+  // ------------------------------------
   else
   {
-    const int team_tid = tid_in_block - (LONG_ROW_WARPS * 32);
-    constexpr int team_warps = (THREADS_PER_BLOCK / 32) - LONG_ROW_WARPS;
-    constexpr int team_vectors = team_warps * (32 / VECTOR_SIZE);
+    const int team_tid = tid_in_block - LONG_ROW_THREADS;
+    const int team_size = BLOCK_SIZE - LONG_ROW_THREADS;
 
-    const int vec_id = team_tid / VECTOR_SIZE;
-    const int tid_in_vec = team_tid & (VECTOR_SIZE - 1);
-
-    for (int row_offset = vec_id; row_offset < s_short_row_count; row_offset += team_vectors)
+    for (int i = team_tid; i < n_reduce_rows_num; i += team_size)
     {
-      const int short_row_local_idx = s_short_row_map[row_offset];
-      const int reduce_row_id = reduceStartRowId + short_row_local_idx;
-      const int row_start_ptr = row_ptr[reduce_row_id];
-      const int row_end_ptr = row_ptr[reduce_row_id + 1];
-      const int reduce_start_idx = max((int)0, row_start_ptr - block_id * NNZ_PER_BLOCK);
-      const int reduce_end_idx = min((int)NNZ_PER_BLOCK, row_end_ptr - block_id * NNZ_PER_BLOCK);
+      if (i == long_row_local_idx)
+        continue;
 
+      const int reduce_row_id = tileStartRow + i;
+      const int reduce_start_idx = max((int)0, row_ptr[reduce_row_id] - block_id * TILE_NNZ);
+      const int reduce_end_idx = min((int)TILE_NNZ, row_ptr[reduce_row_id + 1] - block_id * TILE_NNZ);
+
+      const int len = reduce_end_idx - reduce_start_idx;
       valT sum = 0;
-      for (int i = reduce_start_idx + tid_in_vec; i < reduce_end_idx; i += VECTOR_SIZE)
-      {
-        sum += smem[i];
-      }
-      sum = warpReduceSum<VECTOR_SIZE>(sum);
 
-      if (tid_in_vec == 0)
+      // --- 优化点 1: 对超短行进行完全循环展开 ---
+      // 直接处理最常见的几种情况，避免循环开销
+      switch (len)
       {
-        s_final_sums[short_row_local_idx] = sum;
+      case 1:
+        sum = smem[reduce_start_idx];
+        break;
+      case 2:
+        sum = smem[reduce_start_idx] + smem[reduce_start_idx + 1];
+        break;
+      case 3:
+        sum = smem[reduce_start_idx] + smem[reduce_start_idx + 1] + smem[reduce_start_idx + 2];
+        break;
+      case 4:
+        sum = smem[reduce_start_idx] + smem[reduce_start_idx + 1] + smem[reduce_start_idx + 2] + smem[reduce_start_idx + 3];
+        break;
+      case 0:
+        break; // 长度为0，sum保持0
+      default: // 对于意外的长一些的“短行”，保留循环作为备用
+        for (int k = reduce_start_idx; k < reduce_end_idx; k++)
+        {
+          sum += smem[k];
+        }
+        break;
       }
+      s_final_sums[i] = sum;
     }
   }
 
-  // ====================================================================================
-  // 阶段 4: 最终结果并行写回 (逻辑无误，无需修改)
-  // ====================================================================================
-  __syncthreads();
+  __syncthreads(); // 同步点2: 确保长行各Warp规约、短行计算全部完成
 
-  for (int i = tid_in_block; i < n_reduce_rows_num; i += THREADS_PER_BLOCK)
+  // ====================================================================================
+  // 阶段 3: 最终聚合与写回
+  // ====================================================================================
+  // --- 优化点 2 (续): 长行最终规约 ---
+  // 由第一个Warp聚合所有Warp的结果
+  if (tid_in_block < 32 && long_row_local_idx != -1)
   {
-    const valT final_sum = s_final_sums[i];
+    const int num_warps = LONG_ROW_THREADS / 32;
+    valT final_long_row_sum = (tid_in_block < num_warps) ? s_warp_sums[tid_in_block] : 0.0;
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+      final_long_row_sum += __shfl_down_sync(0xFFFFFFFF, final_long_row_sum, offset);
+    }
+
+    if (tid_in_block == 0)
+    {
+      s_final_sums[long_row_local_idx] = final_long_row_sum;
+    }
+  }
+
+  __syncthreads(); // 同步点3: 确保长行结果已写入s_final_sums
+
+  // 使用前 n_reduce_rows_num 个线程并行写回所有结果 (逻辑不变)
+  if (tid_in_block < n_reduce_rows_num)
+  {
+    const valT final_sum = s_final_sums[tid_in_block];
     if (final_sum == 0.0)
-      continue;
+      return;
 
-    const int final_row_id = reduceStartRowId + i;
-
-    if (n_reduce_rows_num <= 2 || final_row_id == reduceStartRowId || final_row_id == reduceEndRowId - 1)
+    const int final_row_id = tileStartRow + tid_in_block;
+    // 边界行使用原子加，内部行直接写
+    if (final_row_id == tileStartRow || final_row_id == tileEndRow - 1)
     {
       atomicAdd(y + final_row_id, final_sum);
     }
@@ -374,92 +339,8 @@ red_row_vector_3(
   }
 }
 
-template <int THREADS_PER_BLOCK, int VECTOR_SIZE>
-__device__ __forceinline__ void
-dispatch_reduction_strategy(
-    bool use_uneven, int productNnzPerBlock, int n_reduce_rows_num,
-    int tid_in_block, int block_id, int reduceStartRowId, int reduceEndRowId,
-    const int *__restrict__ d_ptr, const valT *__restrict__ smem, valT *__restrict__ y)
-{
-  if (use_uneven)
-  {
-    red_row_vector_3<THREADS_PER_BLOCK, VECTOR_SIZE>(
-        productNnzPerBlock, n_reduce_rows_num, tid_in_block, block_id,
-        reduceStartRowId, reduceEndRowId, d_ptr, smem, y);
-  }
-  else
-  {
-    red_row_vector_1<THREADS_PER_BLOCK, VECTOR_SIZE>(
-        productNnzPerBlock, n_reduce_rows_num, tid_in_block, block_id,
-        reduceStartRowId, reduceEndRowId, d_ptr, smem, y);
-  }
-}
-
 __device__ __forceinline__ bool
-is_imbalanced(const int reduceStartRowId, const int n_reduce_rows_num,
-              const int *__restrict__ d_ptr,
-              const int tid_in_block)
-{
-  const int lane_id = tid_in_block & 31;
-  int my_len = 0;
-  if (lane_id < n_reduce_rows_num)
-  {
-    const int my_row_idx = reduceStartRowId + lane_id;
-    my_len = d_ptr[my_row_idx + 1] - d_ptr[my_row_idx];
-  }
-  int total_nnz_in_warp = my_len;
-  int max_len_in_warp = my_len;
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1)
-  {
-    total_nnz_in_warp += __shfl_down_sync(0xFFFFFFFF, total_nnz_in_warp, offset);
-    max_len_in_warp = max(max_len_in_warp, __shfl_down_sync(0xFFFFFFFF, max_len_in_warp, offset));
-  }
-  bool decision = false;
-  if (lane_id == 0)
-  {
-    const float DOMINANCE_FACTOR = 0.5f;
-    decision = (max_len_in_warp > total_nnz_in_warp * DOMINANCE_FACTOR);
-  }
-  decision = __shfl_sync(0xFFFFFFFF, decision, 0);
-  return decision;
-}
-
-__device__ __forceinline__ bool
-is_imbalanced_small(const int reduceStartRowId, const int n_reduce_rows_num,
-                    const int *__restrict__ d_ptr,
-                    const int tid_in_block)
-{
-  const int lane_id = tid_in_block & 31;
-  int my_len = 0;
-  if (lane_id < n_reduce_rows_num)
-  {
-    const int my_row_idx = reduceStartRowId + lane_id;
-    my_len = d_ptr[my_row_idx + 1] - d_ptr[my_row_idx];
-  }
-  const int len0 = __shfl_sync(0xFFFFFFFF, my_len, 0);
-  const int len1 = __shfl_sync(0xFFFFFFFF, my_len, 1);
-  const int len2 = __shfl_sync(0xFFFFFFFF, my_len, 2);
-  const int len3 = __shfl_sync(0xFFFFFFFF, my_len, 3);
-  bool decision = false;
-  if (lane_id == 0)
-  {
-    const int total_nnz = len0 + len1 + len2 + len3;
-    const int max_len = max(max(len0, len1), max(len2, len3));
-
-    const float DOMINANCE_FACTOR = 0.5f;
-    if (total_nnz > 0)
-    {
-      decision = (max_len > total_nnz * DOMINANCE_FACTOR);
-    }
-  }
-  decision = __shfl_sync(0xFFFFFFFF, decision, 0);
-  return decision;
-}
-
-template <int MAX_N>
-__device__ __forceinline__ bool
-is_imbalanced_warp(const int reduceStartRowId, const int n_reduce_rows_num,
+is_imbalanced_warp(const int tileStartRow, const int n_reduce_rows_num,
                    const int *__restrict__ d_ptr,
                    const int tid_in_block)
 {
@@ -467,13 +348,13 @@ is_imbalanced_warp(const int reduceStartRowId, const int n_reduce_rows_num,
   int my_len = 0;
   if (lane_id < n_reduce_rows_num)
   {
-    const int my_row_idx = reduceStartRowId + lane_id;
+    const int my_row_idx = tileStartRow + lane_id;
     my_len = d_ptr[my_row_idx + 1] - d_ptr[my_row_idx];
   }
   int total_nnz = my_len;
   int max_len = my_len;
 #pragma unroll
-  for (int offset = MAX_N / 2; offset > 0; offset >>= 1)
+  for (int offset = 16; offset > 0; offset >>= 1)
   {
     total_nnz += __shfl_down_sync(0xFFFFFFFF, total_nnz, offset);
     max_len = max(max_len, __shfl_down_sync(0xFFFFFFFF, max_len, offset));
@@ -481,7 +362,7 @@ is_imbalanced_warp(const int reduceStartRowId, const int n_reduce_rows_num,
   bool decision = false;
   if (lane_id == 0)
   {
-    const float DOMINANCE_FACTOR = 0.8f;
+    const float DOMINANCE_FACTOR = 0.9f;
     if (n_reduce_rows_num > 1 && total_nnz > 0)
     {
       decision = (max_len > total_nnz * DOMINANCE_FACTOR);
@@ -491,106 +372,192 @@ is_imbalanced_warp(const int reduceStartRowId, const int n_reduce_rows_num,
   return decision;
 }
 
-template <int THREADS_PER_BLOCK>
+template <int BLOCK_SIZE, int VECTOR_SIZE>
+__device__ __forceinline__ void
+dispatch_reduction_strategy(
+    bool use_uneven, int tileNnz, int n_reduce_rows_num,
+    int tid_in_block, int block_id, int tileStartRow, int tileEndRow,
+    const int *__restrict__ d_ptr, const valT *__restrict__ smem, valT *__restrict__ y)
+{
+  if (use_uneven)
+  {
+    red_row_long_short_specialized<BLOCK_SIZE, 96>(tileNnz, n_reduce_rows_num, tid_in_block, block_id,
+                                                   tileStartRow, tileEndRow, d_ptr, smem, y);
+  }
+  else
+  {
+    red_row_vector<tileNnz, BLOCK_SIZE, 4>(tid_in_block, block_id,
+                                           tileStartRow, tileEndRow, d_ptr, smem, y);
+  }
+}
+
+template <int BLOCK_SIZE>
 __device__ __forceinline__ unsigned int
 calculate_vector_size(int n_reduce_rows_num)
 {
-  if (n_reduce_rows_num >= THREADS_PER_BLOCK)
+  if (n_reduce_rows_num >= BLOCK_SIZE)
   {
     return 2;
   }
-  unsigned int avg_threads_per_row = THREADS_PER_BLOCK / n_reduce_rows_num;
+  unsigned int avg_threads_per_row = BLOCK_SIZE / n_reduce_rows_num;
   unsigned int highest_power_of_2 = 1 << (31 - __clz(avg_threads_per_row));
   return min(32, max(2, highest_power_of_2));
 }
 
-template <int THREADS_PER_BLOCK>
-__global__ void preFreeSpMV_kernel_bench(valT *__restrict__ d_val,
-                                         int *__restrict__ d_ptr,
-                                         int *__restrict__ d_cols,
-                                         int rowA,
-                                         valT *__restrict__ d_x,
-                                         valT *__restrict__ d_y,
-                                         int *__restrict__ startRowPerBlock,
-                                         int productNnzPerThread,
-                                         int productNnzPerBlock)
+template <int P_NNZ, int BLOCK_SIZE>
+__global__ void preFreeSpMV_kernel(valT *__restrict__ d_val,
+                                   int *__restrict__ d_ptr,
+                                   int *__restrict__ d_cols,
+                                   int rowA,
+                                   valT *__restrict__ d_x,
+                                   valT *__restrict__ d_y,
+                                   int *__restrict__ start_row)
 {
   extern __shared__ valT middle_s[];
   const int last = d_ptr[rowA] - 1;
-  int blockNnzStart = productNnzPerBlock * blockIdx.x;
+  const int tileNnz = BLOCK_SIZE * P_NNZ;
+  int blockNnzStart = tileNnz * blockIdx.x;
 
 #pragma unroll
-  for (int round = 0; round < productNnzPerThread; round++)
+  for (int round = 0; round < P_NNZ; round++)
   {
-    const int sIdx = threadIdx.x + round * THREADS_PER_BLOCK;
+    const int sIdx = threadIdx.x + round * BLOCK_SIZE;
     const int gIdx = min(blockNnzStart + sIdx, last);
     middle_s[sIdx] = d_val[gIdx] * __ldg(&d_x[d_cols[gIdx]]);
   }
   __syncthreads();
-
-  const int reduceStartRowId = min(startRowPerBlock[blockIdx.x], rowA);
-  int reduceEndRowId = min(startRowPerBlock[blockIdx.x + 1], rowA);
-  reduceEndRowId = (reduceEndRowId == 0) ? rowA : reduceEndRowId;
-  if (d_ptr[reduceEndRowId] % productNnzPerBlock != 0 || reduceEndRowId == reduceStartRowId)
+  const int tileStartRow = min(start_row[blockIdx.x], rowA);
+  int tileEndRow = min(start_row[blockIdx.x + 1], rowA);
+  tileEndRow = (tileEndRow == 0) ? rowA : tileEndRow;
+  if (d_ptr[tileEndRow] % tileNnz != 0 || tileEndRow == tileStartRow)
   {
-    reduceEndRowId = min(reduceEndRowId + 1, rowA);
+    tileEndRow = min(tileEndRow + 1, rowA);
   }
 
-  const int n_reduce_rows_num = reduceEndRowId - reduceStartRowId;
+  // reduction stage
+  const int n_reduce_rows_num = tileEndRow - tileStartRow;
 
-  if (n_reduce_rows_num > 128)
+  // code 1: No Branch code
+  ////////////////////////////////////////////////////////////////////
+
+  // red_row_thread<tileNnz, BLOCK_SIZE>(threadIdx.x, blockIdx.x,
+  //                                       tileStartRow, tileEndRow,
+  //                                       d_ptr, middle_s, d_y);
+
+  // code 2: Dual Branch code
+  ////////////////////////////////////////////////////////////////////
+
+  // if (n_reduce_rows_num == 1)
+  // {
+  //   red_row_block<tileNnz, BLOCK_SIZE>(threadIdx.x, blockIdx.x,
+  //                                                        tileStartRow,
+  //                                                        d_ptr, middle_s, d_y);
+  // }
+  // else
+  // {
+  //   red_row_thread<tileNnz, BLOCK_SIZE>(threadIdx.x, blockIdx.x,
+  //                                                         tileStartRow, tileEndRow,
+  //                                                         d_ptr, middle_s, d_y);
+  // }
+
+  // code 3: Three-level Balanced Branch code
+  ////////////////////////////////////////////////////////////////////
+  // fast
+  if (n_reduce_rows_num > BLOCK_SIZE / 4)
   {
-
-    red_row_thread<THREADS_PER_BLOCK>(productNnzPerBlock, threadIdx.x, blockIdx.x,
-                                      reduceStartRowId, reduceEndRowId,
-                                      d_ptr, middle_s, d_y);
+    red_row_thread<tileNnz, BLOCK_SIZE>(threadIdx.x, blockIdx.x,
+                                        tileStartRow, tileEndRow,
+                                        d_ptr, middle_s, d_y);
   }
   else if (n_reduce_rows_num == 1)
   {
-    red_row_block<THREADS_PER_BLOCK>(productNnzPerBlock, threadIdx.x, blockIdx.x,
-                                     reduceStartRowId,
-                                     d_ptr, middle_s, d_y);
+    red_row_block<tileNnz, BLOCK_SIZE>(threadIdx.x, blockIdx.x,
+                                       tileStartRow,
+                                       d_ptr, middle_s, d_y);
   }
-  else if (n_reduce_rows_num <= 4)
+  else
   {
-    __shared__ bool use_uneven_path;
-    if ((threadIdx.x >> 5) == 0)
-    {
-      bool decision = is_imbalanced_small(reduceStartRowId, n_reduce_rows_num, d_ptr, threadIdx.x);
-      if (threadIdx.x == 0)
-      {
-        use_uneven_path = decision;
-      }
-    }
-    __syncthreads();
-    dispatch_reduction_strategy<THREADS_PER_BLOCK, 32>(
-        use_uneven_path, productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
-        reduceStartRowId, reduceEndRowId, d_ptr, middle_s, d_y);
+    red_row_vector<tileNnz, BLOCK_SIZE, 4>(
+        threadIdx.x, blockIdx.x,
+        tileStartRow, tileEndRow, d_ptr, middle_s, d_y);
   }
-  else if (n_reduce_rows_num <= 8)
-  {
-    red_row_vector_1<THREADS_PER_BLOCK, 16>(
-        productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
-        reduceStartRowId, reduceEndRowId, d_ptr, middle_s, d_y);
-  }
-  else if (n_reduce_rows_num <= 16)
-  {
-    red_row_vector_1<THREADS_PER_BLOCK, 8>(
-        productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
-        reduceStartRowId, reduceEndRowId, d_ptr, middle_s, d_y);
-  }
-  else if (n_reduce_rows_num <= 32)
-  {
-    red_row_vector_1<THREADS_PER_BLOCK, 4>(
-        productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
-        reduceStartRowId, reduceEndRowId, d_ptr, middle_s, d_y);
-  }
-  else if (n_reduce_rows_num <= 128)
-  {
-    red_row_vector_1<THREADS_PER_BLOCK, 2>(
-        productNnzPerBlock, n_reduce_rows_num, threadIdx.x, blockIdx.x,
-        reduceStartRowId, reduceEndRowId, d_ptr, middle_s, d_y);
-  }
+  ////////////////////////////////////////////////////////////////////
+  // code 4: Three-level imbalanced Branch code
+  // if (n_reduce_rows_num > BLOCK_SIZE / 4)
+  // {
+  //   red_row_thread<tileNnz, BLOCK_SIZE>(threadIdx.x, blockIdx.x,
+  //                                     tileStartRow, tileEndRow,
+  //                                     d_ptr, middle_s, d_y);
+  // }
+  // else if (n_reduce_rows_num == 1)
+  // {
+  //   red_row_block<tileNnz, BLOCK_SIZE>(threadIdx.x, blockIdx.x,
+  //                                    tileStartRow,
+  //                                    d_ptr, middle_s, d_y);
+  // }
+  // else
+  // {
+  //   __shared__ bool use_uneven_path;
+  //   if ((threadIdx.x >> 5) == 0)
+  //   {
+  //     bool decision = is_imbalanced_warp(tileStartRow, n_reduce_rows_num, d_ptr, threadIdx.x);
+  //     if (threadIdx.x == 0)
+  //     {
+  //       use_uneven_path = decision;
+  //     }
+  //   }
+  //   __syncthreads();
+  //   dispatch_reduction_strategy<BLOCK_SIZE, 4>(
+  //       use_uneven_path, tileNnz, n_reduce_rows_num, threadIdx.x, blockIdx.x,
+  //       tileStartRow, tileEndRow, d_ptr, middle_s, d_y);
+  // }
+  ////////////////////////////////////////////////////////////////////
+  // code 5: Fine-grained parallel branching
+  // if (n_reduce_rows_num > BLOCK_SIZE)
+  // {
+  //   red_row_thread<tileNnz, BLOCK_SIZE>(threadIdx.x, blockIdx.x,
+  //                                     tileStartRow, tileEndRow,
+  //                                     d_ptr, middle_s, d_y);
+  // }
+  // else if (n_reduce_rows_num == 1)
+  // {
+  //   red_row_block<tileNnz, BLOCK_SIZE>(threadIdx.x, blockIdx.x,
+  //                                    tileStartRow,
+  //                                    d_ptr, middle_s, d_y);
+  // }
+  // else
+  // {
+  //   const unsigned int vector_size = calculate_vector_size<BLOCK_SIZE>(n_reduce_rows_num);
+  //   switch (vector_size)
+  //   {
+  //   case 32:// 2-8
+  //     red_row_vector<tileNnz, BLOCK_SIZE, 32>(
+  //         threadIdx.x, blockIdx.x,
+  //         tileStartRow, tileEndRow, d_ptr, middle_s, d_y);
+  //     break;
+  //   case 16://9-16
+  //     red_row_vector<tileNnz, BLOCK_SIZE, 16>(
+  //         threadIdx.x, blockIdx.x,
+  //         tileStartRow, tileEndRow, d_ptr, middle_s, d_y);
+  //     break;
+  //   case 8://17-32
+  //     red_row_vector<tileNnz, BLOCK_SIZE, 8>(
+  //         threadIdx.x, blockIdx.x,
+  //         tileStartRow, tileEndRow, d_ptr, middle_s, d_y);
+  //     break;
+  //   case 4://33-64
+  //     red_row_vector<tileNnz, BLOCK_SIZE, 4>(
+  //         threadIdx.x, blockIdx.x,
+  //         tileStartRow, tileEndRow, d_ptr, middle_s, d_y);
+  //     break;
+  //   case 2://65-128
+  //     red_row_vector<tileNnz, BLOCK_SIZE, 2>(
+  //         threadIdx.x, blockIdx.x,
+  //         tileStartRow, tileEndRow, d_ptr, middle_s, d_y);
+  //     break;
+  //   }
+  // }
+  ////////////////////////////////////////////////////////////////////
 }
 
 void preFreeSpMV(valT *csrVal, int *csrRowPtr, int *csrColInd,
@@ -613,48 +580,69 @@ void preFreeSpMV(valT *csrVal, int *csrRowPtr, int *csrColInd,
   cudaMemcpy(d_ptr, csrRowPtr, sizeof(int) * (rowA + 2), cudaMemcpyHostToDevice);
   cudaMemcpy(d_vecX, X_val, sizeof(valT) * colA, cudaMemcpyHostToDevice);
 
-  const int THREADS_PER_BLOCK = 128;
-  int productNnzPerThread = 4;
-  const int WORK_BLOCKS = nnzA / (productNnzPerThread * THREADS_PER_BLOCK) + ((nnzA % (productNnzPerThread * THREADS_PER_BLOCK) == 0) ? 0 : 1);
+  const int BLOCK_SIZE = 128;
+  // int P_NNZ = ((nnzA > 16518948) && (((float)nnzA / ((float)rowA) < 500))) ? 8 : 4;
+  // int P_NNZ = ((nnzA > 200000000) && (((float)nnzA / ((float)rowA) < 500))) ? 8 : 4;
+  const int P_NNZ = 4;
+  const int WORK_BLOCKS = nnzA / (P_NNZ * BLOCK_SIZE) + ((nnzA % (P_NNZ * BLOCK_SIZE) == 0) ? 0 : 1);
 
-  const int startRowPerBlock_len = WORK_BLOCKS + 1;
+  const int start_row_len = WORK_BLOCKS + 1;
 
-  int *startRowPerBlock;
-  cudaMalloc(&startRowPerBlock, sizeof(int) * startRowPerBlock_len);
-  cudaMemset(startRowPerBlock, 0, sizeof(int) * startRowPerBlock_len);
+  int *start_row_accu, *start_row_perf;
+  cudaMalloc(&start_row_accu, sizeof(int) * start_row_len);
+  cudaMalloc(&start_row_perf, sizeof(int) * start_row_len);
+  cudaMemset(start_row_accu, 0, sizeof(int) * start_row_len);
+  cudaMemset(start_row_perf, 0, sizeof(int) * start_row_len);
 
-  int productNnzPerBlock = THREADS_PER_BLOCK * productNnzPerThread;
+  int tileNnz = BLOCK_SIZE * P_NNZ;
 
+  pre_start_rowPerTile<<<divup<uint32_t>(rowA + 1, 128), 128>>>(d_ptr, rowA,
+                                                                start_row_accu,
+                                                                tileNnz);
+  cudaDeviceSynchronize();
+
+  int warm_iter = 200;
+  int test_iter = 4000;
+  for (int i = 0; i < warm_iter; ++i)
+  {
+    pre_start_rowPerTile<<<divup<uint32_t>(rowA + 1, 128), 128>>>(d_ptr, rowA,
+                                                                  start_row_perf,
+                                                                  tileNnz);
+  }
+  cudaDeviceSynchronize();
 
   timer.start();
-  pre_startRowPerTile<<<divup<uint32_t>(rowA + 1, 128), 128>>>(d_ptr, rowA,
-                                                               startRowPerBlock,
-                                                               productNnzPerBlock);
-  *cdPre = (double)timer.stop();
+  for (int i = 0; i < test_iter; ++i)
+  {
+    pre_start_rowPerTile<<<divup<uint32_t>(rowA + 1, 128), 128>>>(d_ptr, rowA,
+                                                                  start_row_perf,
+                                                                  tileNnz);
+  }
+  float pre_total_time_ms = timer.stop();
+  *cdPre = (double)pre_total_time_ms / test_iter;
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess)
   {
-    printf("pre_startRowPerTile kernel launch failed: %s\n", cudaGetErrorString(err));
+    printf("pre_start_rowPerTile kernel launch failed: %s\n", cudaGetErrorString(err));
   }
-  int warm_iter = 200;
-  int test_iter = 4000;
+  const int sharedMemSize = tileNnz * sizeof(valT);
   cudaMemset(d_vecY_perf, 0.0, sizeof(valT) * rowA);
 
   for (int i = 0; i < warm_iter; ++i)
   {
-    preFreeSpMV_kernel_bench<THREADS_PER_BLOCK><<<(WORK_BLOCKS), (THREADS_PER_BLOCK), productNnzPerBlock * sizeof(valT)>>>(d_val, d_ptr, d_indices, rowA, d_vecX, d_vecY_perf, startRowPerBlock, productNnzPerThread, productNnzPerBlock);
+    preFreeSpMV_kernel<P_NNZ, BLOCK_SIZE><<<(WORK_BLOCKS), (BLOCK_SIZE), sharedMemSize>>>(d_val, d_ptr, d_indices, rowA, d_vecX, d_vecY_perf, start_row_accu);
   }
   cudaDeviceSynchronize();
   timer.start();
   for (int i = 0; i < test_iter; ++i)
   {
-    preFreeSpMV_kernel_bench<THREADS_PER_BLOCK><<<(WORK_BLOCKS), (THREADS_PER_BLOCK), productNnzPerBlock * sizeof(valT)>>>(d_val, d_ptr, d_indices, rowA, d_vecX, d_vecY_perf, startRowPerBlock, productNnzPerThread, productNnzPerBlock);
+    preFreeSpMV_kernel<P_NNZ, BLOCK_SIZE><<<(WORK_BLOCKS), (BLOCK_SIZE), sharedMemSize>>>(d_val, d_ptr, d_indices, rowA, d_vecX, d_vecY_perf, start_row_accu);
   }
   float total_loop_time_ms = timer.stop();
 
   cudaMemset(d_vecY_accu, 0.0, sizeof(valT) * rowA);
-  preFreeSpMV_kernel_bench<THREADS_PER_BLOCK><<<(WORK_BLOCKS), (THREADS_PER_BLOCK), productNnzPerBlock * sizeof(valT)>>>(d_val, d_ptr, d_indices, rowA, d_vecX, d_vecY_accu, startRowPerBlock, productNnzPerThread, productNnzPerBlock);
+  preFreeSpMV_kernel<P_NNZ, BLOCK_SIZE><<<(WORK_BLOCKS), (BLOCK_SIZE), sharedMemSize>>>(d_val, d_ptr, d_indices, rowA, d_vecX, d_vecY_accu, start_row_accu);
 
   cudaDeviceSynchronize();
   CUDA_CHECK_ERROR(cudaGetLastError());
@@ -669,5 +657,6 @@ void preFreeSpMV(valT *csrVal, int *csrRowPtr, int *csrColInd,
   cudaFree(d_val);
   cudaFree(d_indices);
   cudaFree(d_ptr);
-  cudaFree(startRowPerBlock);
+  cudaFree(start_row_accu);
+  cudaFree(start_row_perf);
 }

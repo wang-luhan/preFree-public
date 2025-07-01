@@ -9,7 +9,7 @@ make.sh
 *.wsg
 converter
 !*_result.mtx
-!data/graph/grb_ppt/grb_ppt.mtx
+data/
 nohup.out
 run.sh
 *.aux
@@ -68,7 +68,8 @@ Module.symvers
 Mkfile.old
 dkms.conf
 # Performance data log
-# *.log
-# *.csv
+*.log
+*.csv
 *.xlsx
+*.ncu-rep
 
