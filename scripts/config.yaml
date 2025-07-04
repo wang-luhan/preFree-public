@@ -1,0 +1,44 @@
+# PreFree SpMV Auto-tuning Configuration
+
+# Size thresholds for matrix classification (based on nnz)
+size_thresholds:
+  small_upper: 5000000      # Matrices with nnz < 1M are small
+  medium_upper: 20000000    # Matrices with nnz < 20M are medium
+  # Matrices with nnz >= 20M are large
+
+# Code versions to test (1-5)
+code_versions: [1, 2, 3, 4, 5]
+
+# P_NNZ values to test
+p_nnz_values: [4, 8]
+
+# Test matrices for each size class
+# Replace these paths with your actual matrix files
+test_matrices:
+  small:
+    - "../../../../rootdata/mtx/roadNet-PA/roadNet-PA.mtx"
+    - "../../../../rootdata/mtx/poisson3Db/poisson3Db.mtx"
+    - "../../../../rootdata/mtx/cnr-2000/cnr-2000.mtx"
+  medium:
+    - "../../../../rootdata/mtx/web-Google/web-Google.mtx"
+    - "../../../../rootdata/mtx/amazon-2008/amazon-2008.mtx"
+    - "../../../../rootdata/mtx/road_central/road_central.mtx"
+  large:
+    - "../../../../rootdata/mtx/circuit5M/circuit5M.mtx"
+    - "../../../../rootdata/mtx/coPapersCiteseer/coPapersCiteseer.mtx"
+    - "../../../../rootdata/mtx/cage15/cage15.mtx"
+
+# Performance testing parameters
+performance_test:
+  warmup_iterations: 100
+  test_iterations: 2000
+  timeout_seconds: 240
+
+# GPU selection (0-based index)
+gpu_device: 0
+
+# Output settings
+output:
+  save_detailed_results: true
+  results_file: "profiling_results.json"
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR

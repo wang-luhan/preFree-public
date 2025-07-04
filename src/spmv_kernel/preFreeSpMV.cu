@@ -149,10 +149,10 @@ red_row_vector(const int tid_in_block, const int block_id,
   }
 }
 
-template <int BLOCK_SIZE, int LONG_ROW_THREADS>
+template <int TILE_NNZ, int BLOCK_SIZE, int LONG_ROW_THREADS>
 __device__ __forceinline__ void
 red_row_long_short_specialized(
-    int TILE_NNZ, const int n_reduce_rows_num, const int tid_in_block, const int block_id,
+    const int n_reduce_rows_num, const int tid_in_block, const int block_id,
     const int tileStartRow, const int tileEndRow,
     const int *__restrict__ row_ptr, const valT *__restrict__ smem, valT *__restrict__ y)
 {
@@ -372,21 +372,21 @@ is_imbalanced_warp(const int tileStartRow, const int n_reduce_rows_num,
   return decision;
 }
 
-template <int BLOCK_SIZE, int VECTOR_SIZE>
+template <int TILE_NNZ, int BLOCK_SIZE, int VECTOR_SIZE>
 __device__ __forceinline__ void
 dispatch_reduction_strategy(
-    bool use_uneven, int tileNnz, int n_reduce_rows_num,
+    bool use_uneven, int n_reduce_rows_num,
     int tid_in_block, int block_id, int tileStartRow, int tileEndRow,
     const int *__restrict__ d_ptr, const valT *__restrict__ smem, valT *__restrict__ y)
 {
   if (use_uneven)
   {
-    red_row_long_short_specialized<BLOCK_SIZE, 96>(tileNnz, n_reduce_rows_num, tid_in_block, block_id,
+    red_row_long_short_specialized<TILE_NNZ, BLOCK_SIZE, 96>(n_reduce_rows_num, tid_in_block, block_id,
                                                    tileStartRow, tileEndRow, d_ptr, smem, y);
   }
   else
   {
-    red_row_vector<tileNnz, BLOCK_SIZE, 4>(tid_in_block, block_id,
+    red_row_vector<TILE_NNZ, BLOCK_SIZE, 4>(tid_in_block, block_id,
                                            tileStartRow, tileEndRow, d_ptr, smem, y);
   }
 }
@@ -507,8 +507,8 @@ __global__ void preFreeSpMV_kernel(valT *__restrict__ d_val,
   //     }
   //   }
   //   __syncthreads();
-  //   dispatch_reduction_strategy<BLOCK_SIZE, 4>(
-  //       use_uneven_path, tileNnz, n_reduce_rows_num, threadIdx.x, blockIdx.x,
+  //   dispatch_reduction_strategy<tileNnz, BLOCK_SIZE, 4>(
+  //       use_uneven_path, n_reduce_rows_num, threadIdx.x, blockIdx.x,
   //       tileStartRow, tileEndRow, d_ptr, middle_s, d_y);
   // }
   ////////////////////////////////////////////////////////////////////
